@@ -66,6 +66,8 @@ git clone https://github.com/Lumivers/Lumi-Hub-plugin.git lumi_hub
 
 👉 **[Lumi-Hub 主仓库 Releases](https://github.com/Lumivers/Lumi-Hub/releases)**
 
+> **⚠️ 注意**：当前 Beta 阶段，客户端仅支持连接 **本机** 的 AstrBot（即 AstrBot 本体必须与客户端运行在同一台电脑上）。
+
 ---
 
 ## 系统要求
