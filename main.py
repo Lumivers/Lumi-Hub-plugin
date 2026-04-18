@@ -8,11 +8,8 @@ import time
 import uuid
 import json
 import os
-import base64
-import hashlib
-import mimetypes
 from collections.abc import Coroutine
-from typing import Any
+from typing import Any, Callable
 
 from astrbot.core import db_helper
 
@@ -33,12 +30,24 @@ from .ws_server import LumiWSServer
 from .lumi_event import LumiMessageEvent
 from .database.manager import DatabaseManager
 from .mcp_manager import LumiMCPManager
+from .handlers import (
+    AuthHandlersMixin,
+    ChatHandlersMixin,
+    HistoryHandlersMixin,
+    McpHandlersMixin,
+    PersonaHandlersMixin,
+    UploadHandlersMixin,
+    VoiceHandlersMixin,
+)
+from .voice_extensions import (
+    DashScopeTTSProvider,
+    SpeechSessionController,
+    VoiceExtensionRegistry,
+)
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import register, Context
-import time
-import uuid
 
 # 全局共享状态，用于跨类传递实例
 _lumi_shared_state = {}
@@ -301,7 +310,16 @@ class LumiHub(Star):
     },
     support_streaming_message=True,
 )
-class LumiHubAdapter(Platform):
+class LumiHubAdapter(
+    ChatHandlersMixin,
+    HistoryHandlersMixin,
+    PersonaHandlersMixin,
+    VoiceHandlersMixin,
+    UploadHandlersMixin,
+    AuthHandlersMixin,
+    McpHandlersMixin,
+    Platform,
+):
     """Lumi-Hub 平台适配器。
 
     功能：
@@ -333,6 +351,9 @@ class LumiHubAdapter(Platform):
         data_dir = os.path.join(project_root, "data")
         self.data_dir = data_dir
         self.db = DatabaseManager(data_dir=data_dir)
+        self.voice_config_path = os.path.join(data_dir, "voice_config.json")
+        self._voice_config_cache = self._load_voice_config()
+        self._dashscope_provider: DashScopeTTSProvider | None = None
 
         # 上传缓存目录与会话状态
         self.upload_root_dir = os.path.join(data_dir, "uploads")
@@ -353,6 +374,35 @@ class LumiHubAdapter(Platform):
         
         # 记录已验证的 websocket session -> user_id
         self.active_sessions: dict[str, int] = {}
+        self.voice_registry = VoiceExtensionRegistry()
+        self.speech_sessions = SpeechSessionController()
+        self._voice_turn_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        self._shared_state = _lumi_shared_state
+        self._setup_voice_extensions()
+        self._message_handlers: dict[
+            str, Callable[[dict, str], Coroutine[Any, Any, None]]
+        ] = {
+            "CHAT_REQUEST": self._handle_chat_request,
+            "PERSONA_SWITCH": self._handle_persona_switch,
+            "PERSONA_LIST": self._handle_persona_list,
+            "AUTH_REGISTER": self._handle_auth_register,
+            "AUTH_LOGIN": self._handle_auth_login,
+            "AUTH_RESTORE": self._handle_auth_restore,
+            "HISTORY_REQUEST": self._handle_history_request,
+            "MCP_CONFIG_GET": self._handle_mcp_config_get,
+            "MCP_CONFIG_UPDATE": self._handle_mcp_config_update,
+            "PERSONA_CLEAR_HISTORY": self._handle_persona_clear_history,
+            "MESSAGE_DELETE": self._handle_message_delete,
+            "PERSONA_DELETE": self._handle_persona_delete,
+            "FILE_UPLOAD_INIT": self._handle_file_upload_init,
+            "FILE_UPLOAD_CHUNK": self._handle_file_upload_chunk,
+            "FILE_UPLOAD_COMPLETE": self._handle_file_upload_complete,
+            "VOICE_CONFIG_GET": self._handle_voice_config_get,
+            "VOICE_CONFIG_SET": self._handle_voice_config_set,
+            "VOICE_TTS_REQUEST": self._dispatch_voice_tts_request,
+            "VOICE_INTERRUPT": self._handle_voice_interrupt,
+            "TTS_CANCEL": self._handle_voice_interrupt,
+        }
 
         self.metadata = PlatformMetadata(
             name="lumi_hub",
@@ -364,6 +414,55 @@ class LumiHubAdapter(Platform):
         )
 
         self._shutdown_event = asyncio.Event()
+
+    def _setup_voice_extensions(self) -> None:
+        provider_name = str(os.environ.get("LUMI_VOICE_PROVIDER", "dashscope")).strip().lower()
+        if provider_name != "dashscope":
+            logger.warning("[Lumi-Hub] Voice provider '%s' is not supported yet", provider_name)
+            return
+
+        env_default_voice = str(os.environ.get("LUMI_DASHSCOPE_VOICE_ID", "")).strip()
+        cached_default_voice = str(self._voice_config_cache.get("dashscope_voice_id", "")).strip()
+        default_voice = env_default_voice or cached_default_voice
+
+        provider = DashScopeTTSProvider(
+            model=str(os.environ.get("LUMI_DASHSCOPE_MODEL", "cosyvoice-v3.5-plus")).strip(),
+            default_voice=default_voice,
+            websocket_url=str(os.environ.get("LUMI_DASHSCOPE_WS_URL", "")).strip(),
+            http_url=str(os.environ.get("LUMI_DASHSCOPE_HTTP_URL", "")).strip(),
+        )
+        cached_api_key = str(self._voice_config_cache.get("dashscope_api_key", "")).strip()
+        if cached_api_key:
+            provider.set_api_key(cached_api_key)
+
+        self.voice_registry.register_tts("dashscope", provider)
+        self.voice_registry.set_default_tts("dashscope")
+        self._dashscope_provider = provider
+
+        if not provider.has_api_key():
+            logger.warning("[Lumi-Hub] DASHSCOPE_API_KEY is empty. Voice synthesis requests will fail until configured.")
+
+        logger.info("[Lumi-Hub] Voice extension registered: dashscope")
+
+    def _load_voice_config(self) -> dict[str, Any]:
+        if not os.path.exists(self.voice_config_path):
+            return {}
+        try:
+            with open(self.voice_config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+            return {}
+        except Exception as e:
+            logger.warning(f"[Lumi-Hub] Failed to load voice config: {e}")
+            return {}
+
+    def _save_voice_config(self) -> None:
+        try:
+            with open(self.voice_config_path, "w", encoding="utf-8") as f:
+                json.dump(self._voice_config_cache, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"[Lumi-Hub] Failed to save voice config: {e}")
 
     def run(self) -> Coroutine[Any, Any, None]:
         """返回平台运行协程，AstrBot 会将其作为 asyncio.Task 启动。"""
@@ -385,6 +484,12 @@ class LumiHubAdapter(Platform):
     async def terminate(self) -> None:
         """关闭平台适配器。"""
         logger.info("[Lumi-Hub] 平台适配器关闭中...")
+
+        for task in list(self._voice_turn_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._voice_turn_tasks.clear()
+
         self._shutdown_event.set()
         await self.ws_server.stop()
         
@@ -452,42 +557,27 @@ class LumiHubAdapter(Platform):
         """处理从 WebSocket Client 收到的业务消息。"""
         msg_type = message.get("type", "")
 
-        if msg_type == "CHAT_REQUEST":
-            await self._handle_chat_request(message, ws_session_id)
-        elif msg_type == "PERSONA_SWITCH":
-            await self._handle_persona_switch(message, ws_session_id)
-        elif msg_type == "PERSONA_LIST":
-            await self._handle_persona_list(message, ws_session_id)
-        elif msg_type == "AUTH_REGISTER":
-            await self._handle_auth_register(message, ws_session_id)
-        elif msg_type == "AUTH_LOGIN":
-            await self._handle_auth_login(message, ws_session_id)
-        elif msg_type == "AUTH_RESTORE":
-            await self._handle_auth_restore(message, ws_session_id)
-        elif msg_type == "HISTORY_REQUEST":
-            await self._handle_history_request(message, ws_session_id)
-        elif msg_type == "MCP_CONFIG_GET":
-            await self._handle_mcp_config_get(message, ws_session_id)
-        elif msg_type == "MCP_CONFIG_UPDATE":
-            await self._handle_mcp_config_update(message, ws_session_id)
-        elif msg_type == "PERSONA_CLEAR_HISTORY":
-            await self._handle_persona_clear_history(message, ws_session_id)
-        elif msg_type == "MESSAGE_DELETE":
-            await self._handle_message_delete(message, ws_session_id)
-        elif msg_type == "PERSONA_DELETE":
-            await self._handle_persona_delete(message, ws_session_id)
-        elif msg_type == "FILE_UPLOAD_INIT":
-            await self._handle_file_upload_init(message, ws_session_id)
-        elif msg_type == "FILE_UPLOAD_CHUNK":
-            await self._handle_file_upload_chunk(message, ws_session_id)
-        elif msg_type == "FILE_UPLOAD_COMPLETE":
-            await self._handle_file_upload_complete(message, ws_session_id)
-        else:
+        handler = self._message_handlers.get(msg_type)
+        if handler is None:
             logger.warning(f"[Lumi-Hub] 未知消息类型: {msg_type}")
+            return
+
+        await handler(message, ws_session_id)
 
     async def _handle_ws_disconnect(self, ws_session_id: str) -> None:
         """WebSocket 断开后的资源清理。"""
         self.active_sessions.pop(ws_session_id, None)
+        active_turn = await self.speech_sessions.clear_session(ws_session_id)
+        if active_turn:
+            await self.voice_registry.cancel_all(ws_session_id, active_turn)
+
+        stale_voice_keys = [
+            key for key in self._voice_turn_tasks.keys() if key[0] == ws_session_id
+        ]
+        for key in stale_voice_keys:
+            task = self._voice_turn_tasks.pop(key, None)
+            if task and not task.done():
+                task.cancel()
 
         stale_upload_ids = [
             upload_id
@@ -496,411 +586,6 @@ class LumiHubAdapter(Platform):
         ]
         for upload_id in stale_upload_ids:
             self._discard_upload_session(upload_id)
-
-    def _normalize_mime(self, file_name: str, mime_type: str) -> str:
-        guessed = mimetypes.guess_type(file_name)[0]
-        final_mime = (mime_type or guessed or "application/octet-stream").lower()
-        return final_mime
-
-    def _is_allowed_mime(self, mime_type: str) -> bool:
-        if mime_type in self.allowed_mime_exact:
-            return True
-        return any(mime_type.startswith(prefix) for prefix in self.allowed_mime_prefixes)
-
-    def _safe_file_name(self, file_name: str) -> str:
-        base_name = os.path.basename(file_name or "file.bin")
-        # 避免目录穿越，替换常见危险字符
-        return "".join(c if c not in '<>:"/\\|?*' else '_' for c in base_name)
-
-    def _extract_pdf_preview(self, abs_path: str, max_chars: int = 6000, max_pages: int = 5) -> str:
-        """提取 PDF 的前几页文本用于提示词增强。若依赖缺失或解析失败则返回空字符串。"""
-        if not abs_path or not os.path.exists(abs_path):
-            return ""
-        try:
-            from pypdf import PdfReader  # type: ignore
-        except Exception:
-            return ""
-
-        try:
-            reader = PdfReader(abs_path)
-            parts: list[str] = []
-            for idx, page in enumerate(reader.pages):
-                if idx >= max_pages:
-                    break
-                text = page.extract_text() or ""
-                if text.strip():
-                    parts.append(text.strip())
-                if sum(len(p) for p in parts) >= max_chars:
-                    break
-            merged = "\n\n".join(parts).strip()
-            if len(merged) > max_chars:
-                merged = merged[:max_chars]
-            return merged
-        except Exception as e:
-            logger.warning(f"[Lumi-Hub] PDF 解析失败: {e}")
-            return ""
-
-    async def _send_upload_error(self, ws_session_id: str, msg_id: str, detail: str, upload_id: str = "") -> None:
-        await self.ws_server.send_to_client(ws_session_id, {
-            "message_id": msg_id,
-            "type": "FILE_UPLOAD_ERROR",
-            "source": "host",
-            "target": "client",
-            "timestamp": int(time.time() * 1000),
-            "payload": {
-                "upload_id": upload_id,
-                "detail": detail,
-            },
-        })
-
-    def _discard_upload_session(self, upload_id: str) -> None:
-        session = self.upload_sessions.pop(upload_id, None)
-        if not session:
-            return
-        tmp_path = session.get("tmp_path", "")
-        try:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception as e:
-            logger.warning(f"[Lumi-Hub] 清理临时上传文件失败: {e}")
-
-    async def _handle_file_upload_init(self, message: dict, ws_session_id: str) -> None:
-        msg_id = message.get("message_id", str(uuid.uuid4())[:8])
-        user_id = self.active_sessions.get(ws_session_id)
-        if not user_id:
-            await self._send_upload_error(ws_session_id, msg_id, "请先登录")
-            return
-
-        payload = message.get("payload", {})
-        file_name = self._safe_file_name(payload.get("file_name", "file.bin"))
-        mime_type = self._normalize_mime(file_name, payload.get("mime_type", ""))
-        size_bytes = int(payload.get("size_bytes", 0) or 0)
-        sha256_expected = str(payload.get("sha256", "") or "").lower()
-
-        if size_bytes <= 0:
-            await self._send_upload_error(ws_session_id, msg_id, "无效文件大小")
-            return
-        if size_bytes > self.max_upload_size_bytes:
-            await self._send_upload_error(ws_session_id, msg_id, f"文件过大，最大支持 {self.max_upload_size_bytes} 字节")
-            return
-        if not self._is_allowed_mime(mime_type):
-            await self._send_upload_error(ws_session_id, msg_id, f"不支持的文件类型: {mime_type}")
-            return
-
-        upload_id = str(uuid.uuid4())
-        tmp_path = os.path.join(self.upload_staging_dir, f"{upload_id}.part")
-        # 先创建空文件，便于后续追加
-        with open(tmp_path, "wb"):
-            pass
-
-        self.upload_sessions[upload_id] = {
-            "user_id": user_id,
-            "ws_session_id": ws_session_id,
-            "file_name": file_name,
-            "mime_type": mime_type,
-            "size_bytes": size_bytes,
-            "sha256_expected": sha256_expected,
-            "tmp_path": tmp_path,
-            "received_bytes": 0,
-            "hasher": hashlib.sha256(),
-            "started_at": int(time.time()),
-        }
-
-        await self.ws_server.send_to_client(ws_session_id, {
-            "message_id": msg_id,
-            "type": "FILE_UPLOAD_ACK",
-            "source": "host",
-            "target": "client",
-            "timestamp": int(time.time() * 1000),
-            "payload": {
-                "phase": "init",
-                "upload_id": upload_id,
-                "chunk_size_hint": 262144,
-                "status": "ready",
-            },
-        })
-
-    async def _handle_file_upload_chunk(self, message: dict, ws_session_id: str) -> None:
-        msg_id = message.get("message_id", str(uuid.uuid4())[:8])
-        payload = message.get("payload", {})
-        upload_id = str(payload.get("upload_id", "") or "")
-        chunk_b64 = payload.get("chunk_base64") or payload.get("chunk") or ""
-        chunk_index = int(payload.get("chunk_index", 0) or 0)
-
-        session = self.upload_sessions.get(upload_id)
-        if not session:
-            await self._send_upload_error(ws_session_id, msg_id, "上传会话不存在", upload_id)
-            return
-        if session.get("ws_session_id") != ws_session_id:
-            await self._send_upload_error(ws_session_id, msg_id, "上传会话不匹配", upload_id)
-            return
-
-        try:
-            chunk_bytes = base64.b64decode(chunk_b64, validate=True)
-        except Exception:
-            self._discard_upload_session(upload_id)
-            await self._send_upload_error(ws_session_id, msg_id, "分片不是合法 base64", upload_id)
-            return
-
-        if not chunk_bytes:
-            await self._send_upload_error(ws_session_id, msg_id, "空分片无效", upload_id)
-            return
-
-        session["received_bytes"] += len(chunk_bytes)
-        if session["received_bytes"] > session["size_bytes"]:
-            self._discard_upload_session(upload_id)
-            await self._send_upload_error(ws_session_id, msg_id, "接收字节超过声明大小", upload_id)
-            return
-
-        try:
-            with open(session["tmp_path"], "ab") as f:
-                f.write(chunk_bytes)
-            session["hasher"].update(chunk_bytes)
-        except Exception as e:
-            self._discard_upload_session(upload_id)
-            await self._send_upload_error(ws_session_id, msg_id, f"写入分片失败: {e}", upload_id)
-            return
-
-        await self.ws_server.send_to_client(ws_session_id, {
-            "message_id": msg_id,
-            "type": "FILE_UPLOAD_ACK",
-            "source": "host",
-            "target": "client",
-            "timestamp": int(time.time() * 1000),
-            "payload": {
-                "phase": "chunk",
-                "upload_id": upload_id,
-                "chunk_index": chunk_index,
-                "received_bytes": session["received_bytes"],
-            },
-        })
-
-    async def _handle_file_upload_complete(self, message: dict, ws_session_id: str) -> None:
-        msg_id = message.get("message_id", str(uuid.uuid4())[:8])
-        payload = message.get("payload", {})
-        upload_id = str(payload.get("upload_id", "") or "")
-        session = self.upload_sessions.get(upload_id)
-
-        if not session:
-            await self._send_upload_error(ws_session_id, msg_id, "上传会话不存在", upload_id)
-            return
-        if session.get("ws_session_id") != ws_session_id:
-            await self._send_upload_error(ws_session_id, msg_id, "上传会话不匹配", upload_id)
-            return
-
-        if session["received_bytes"] != session["size_bytes"]:
-            self._discard_upload_session(upload_id)
-            await self._send_upload_error(
-                ws_session_id,
-                msg_id,
-                f"文件大小不匹配: expected={session['size_bytes']} received={session['received_bytes']}",
-                upload_id,
-            )
-            return
-
-        actual_sha256 = session["hasher"].hexdigest().lower()
-        expected_sha256 = session.get("sha256_expected", "")
-        if expected_sha256 and expected_sha256 != actual_sha256:
-            self._discard_upload_session(upload_id)
-            await self._send_upload_error(ws_session_id, msg_id, "文件哈希校验失败", upload_id)
-            return
-
-        now = time.localtime()
-        final_dir = os.path.join(
-            self.upload_root_dir,
-            f"user_{session['user_id']}",
-            f"{now.tm_year:04d}",
-            f"{now.tm_mon:02d}",
-            f"{now.tm_mday:02d}",
-        )
-        os.makedirs(final_dir, exist_ok=True)
-
-        final_name = f"{upload_id}_{session['file_name']}"
-        final_abs_path = os.path.join(final_dir, final_name)
-        final_rel_path = os.path.relpath(final_abs_path, self.data_dir).replace("\\", "/")
-
-        try:
-            os.replace(session["tmp_path"], final_abs_path)
-            attachment = self.db.create_attachment(
-                user_id=session["user_id"],
-                file_name=session["file_name"],
-                storage_path=final_rel_path,
-                mime_type=session["mime_type"],
-                size_bytes=session["size_bytes"],
-                sha256=actual_sha256,
-            )
-        except Exception as e:
-            self._discard_upload_session(upload_id)
-            await self._send_upload_error(ws_session_id, msg_id, f"完成上传失败: {e}", upload_id)
-            return
-
-        self.upload_sessions.pop(upload_id, None)
-
-        await self.ws_server.send_to_client(ws_session_id, {
-            "message_id": msg_id,
-            "type": "FILE_UPLOAD_ACK",
-            "source": "host",
-            "target": "client",
-            "timestamp": int(time.time() * 1000),
-            "payload": {
-                "phase": "complete",
-                "upload_id": upload_id,
-                "status": "success",
-                "attachment": attachment,
-            },
-        })
-
-    async def _handle_mcp_config_get(self, message: dict, ws_session_id: str) -> None:
-        """获取当前 MCP 配置"""
-        msg_id = message.get("message_id", str(uuid.uuid4())[:8])
-        mcp_manager = _lumi_shared_state.get("mcp_manager")
-        
-        if mcp_manager:
-            config = mcp_manager.get_config()
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id, "type": "MCP_CONFIG_RESPONSE", "source": "host", "target": "client",
-                "payload": {"status": "success", "config": config}
-            })
-        else:
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id, "type": "MCP_CONFIG_RESPONSE", "source": "host", "target": "client",
-                "payload": {"status": "error", "message": "MCP Manager not initialized"}
-            })
-
-    async def _handle_mcp_config_update(self, message: dict, ws_session_id: str) -> None:
-        """更新并热重载 MCP 配置"""
-        payload = message.get("payload", {})
-        config = payload.get("config", {})
-        msg_id = message.get("message_id", str(uuid.uuid4())[:8])
-        
-        mcp_manager = _lumi_shared_state.get("mcp_manager")
-        if mcp_manager:
-            try:
-                await mcp_manager.update_config(config)
-                await self.ws_server.send_to_client(ws_session_id, {
-                    "message_id": msg_id, "type": "MCP_CONFIG_UPDATE_RESPONSE", "source": "host", "target": "client",
-                    "payload": {"status": "success", "message": "Config updated and servers hot-reloaded"}
-                })
-            except Exception as e:
-                logger.error(f"[Lumi-Hub] 热重载 MCP 失败: {e}")
-                await self.ws_server.send_to_client(ws_session_id, {
-                    "message_id": msg_id, "type": "MCP_CONFIG_UPDATE_RESPONSE", "source": "host", "target": "client",
-                    "payload": {"status": "error", "message": str(e)}
-                })
-        else:
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id, "type": "MCP_CONFIG_UPDATE_RESPONSE", "source": "host", "target": "client",
-                "payload": {"status": "error", "message": "MCP Manager not initialized"}
-            })
-
-    async def _handle_auth_register(self, message: dict, ws_session_id: str) -> None:
-        payload = message.get("payload", {})
-        username = payload.get("username", "")
-        password = payload.get("password", "")
-        msg_id = message.get("message_id", str(uuid.uuid4())[:8])
-        try:
-            result = self.db.create_user(username, password)
-        except Exception as e:
-            logger.error(f"[Lumi-Hub] 注册时数据库异常: {e}")
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id, "type": "AUTH_RESPONSE", "source": "host", "target": "client",
-                "payload": {"status": "error", "message": f"Server error: {e}"}
-            })
-            return
-        
-        if "error" in result:
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id, "type": "AUTH_RESPONSE", "source": "host", "target": "client",
-                "payload": {"status": "error", "message": result["error"]}
-            })
-        else:
-            # 注册成功直接登录
-            self.active_sessions[ws_session_id] = result["id"]
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id, "type": "AUTH_RESPONSE", "source": "host", "target": "client",
-                "payload": {"status": "success", "user": {"id": result["id"], "username": result["username"]}, "token": result.get("token", "")}
-            })
-            logger.info(f"[Lumi-Hub] 用户注册并登录成功: {username}")
-
-    async def _handle_auth_login(self, message: dict, ws_session_id: str) -> None:
-        payload = message.get("payload", {})
-        username = payload.get("username", "")
-        password = payload.get("password", "")
-        msg_id = message.get("message_id", str(uuid.uuid4())[:8])
-        try:
-            result = self.db.verify_user(username, password)
-        except Exception as e:
-            logger.error(f"[Lumi-Hub] 登录时数据库异常: {e}")
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id, "type": "AUTH_RESPONSE", "source": "host", "target": "client",
-                "payload": {"status": "error", "message": f"Server error: {e}"}
-            })
-            return
-        
-        if "error" in result:
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id, "type": "AUTH_RESPONSE", "source": "host", "target": "client",
-                "payload": {"status": "error", "message": result["error"]}
-            })
-        else:
-            self.active_sessions[ws_session_id] = result["id"]
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id, "type": "AUTH_RESPONSE", "source": "host", "target": "client",
-                "payload": {"status": "success", "user": {"id": result["id"], "username": result["username"]}, "token": result.get("token", "")}
-            })
-            logger.info(f"[Lumi-Hub] 用户登录成功: {username}")
-
-    async def _handle_auth_restore(self, message: dict, ws_session_id: str) -> None:
-        payload = message.get("payload", {})
-        token = payload.get("token", "")
-        msg_id = message.get("message_id", str(uuid.uuid4())[:8])
-
-        if not token:
-            return
-
-        user = self.db.get_user_by_token(token)
-        if user:
-            self.active_sessions[ws_session_id] = user["id"]
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id, "type": "AUTH_RESPONSE", "source": "host", "target": "client",
-                "payload": {"status": "success", "user": user, "token": token}
-            })
-            logger.info(f"[Lumi-Hub] 用户通过 Token 恢复会话成功: {user['username']}")
-        else:
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id, "type": "AUTH_RESPONSE", "source": "host", "target": "client",
-                "payload": {"status": "error", "message": "Invalid or expired token"}
-            })
-
-    async def _handle_history_request(self, message: dict, ws_session_id: str) -> None:
-        user_id = self.active_sessions.get(ws_session_id)
-        msg_id = message.get("message_id", str(uuid.uuid4())[:8])
-        if not user_id:
-            logger.warning(f"[Lumi-Hub] 拒绝未登录用户的历史记录请求")
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id, "type": "ERROR_ALERT", "source": "host", "target": "client",
-                "payload": {"error_code": "UNAUTHORIZED", "detail": "请先登录"}
-            })
-            return
-            
-        payload = message.get("payload", {})
-        limit = payload.get("limit", 50)
-        offset = payload.get("offset", 0)
-        persona_id = payload.get("persona_id", "default")
-        
-        messages = self.db.get_messages(user_id=user_id, persona_id=persona_id, limit=limit, offset=offset)
-        
-        await self.ws_server.send_to_client(ws_session_id, {
-            "message_id": msg_id,
-            "type": "HISTORY_RESPONSE",
-            "source": "host",
-            "target": "client",
-            "timestamp": int(time.time() * 1000),
-            "payload": {
-                "messages": messages,
-                "has_more": len(messages) == limit
-            }
-        })
 
     @filter.llm_tool(name="call_mcp_tool")
     async def call_mcp_tool(self, event: AstrMessageEvent, server_name: str, tool_name: str, arguments_json: str):
@@ -939,368 +624,3 @@ class LumiHubAdapter(Platform):
         except Exception as e:
             return f"Error executing tool: {e}"
 
-    async def _handle_chat_request(self, message: dict, ws_session_id: str) -> None:
-        """
-        处理 CHAT_REQUEST：
-        1. 构造 AstrBotMessage
-        2. 包装为 LumiMessageEvent
-        3. commit_event() 注入 AstrBot 事件队列
-        4. AstrBot 自动调 LLM → 调用 event.send() → WebSocket 回传
-        """
-        payload = message.get("payload", {})
-        user_content = payload.get("content", "")
-        original_user_content = str(user_content or "").strip()
-        attachments = payload.get("attachments", []) or []
-        msg_id = message.get("message_id", str(uuid.uuid4())[:8])
-        context_id = payload.get("context_id", ws_session_id)
-        persona_id = payload.get("persona_id", "default")
-
-        attachment_lines: list[str] = []
-        attachment_hints: list[str] = []
-        image_components: list[Image] = []
-        video_components: list[Video] = []
-        if isinstance(attachments, list):
-            for att in attachments:
-                if not isinstance(att, dict):
-                    continue
-                file_name = str(att.get("file_name", "未命名文件"))
-                mime_type = str(att.get("mime_type", "application/octet-stream"))
-                size_bytes = int(att.get("size_bytes", 0) or 0)
-                storage_path = str(att.get("storage_path", "") or "")
-
-                attachment_lines.append(
-                    f"- {file_name} ({mime_type}, {size_bytes} bytes)"
-                )
-
-                if mime_type.startswith("image/") and storage_path:
-                    abs_path = os.path.join(self.data_dir, storage_path)
-                    if os.path.exists(abs_path):
-                        try:
-                            image_components.append(Image.fromFileSystem(abs_path))
-                        except Exception as e:
-                            logger.warning(f"[Lumi-Hub] 附加图片组件失败({file_name}): {e}")
-
-                if mime_type.startswith("video/") and storage_path:
-                    abs_path = os.path.join(self.data_dir, storage_path)
-                    if os.path.exists(abs_path):
-                        try:
-                            video_components.append(Video.fromFileSystem(abs_path))
-                        except Exception as e:
-                            logger.warning(f"[Lumi-Hub] 附加视频组件失败({file_name}): {e}")
-
-                if mime_type == "application/pdf" and storage_path:
-                    abs_path = os.path.join(self.data_dir, storage_path)
-                    preview = self._extract_pdf_preview(abs_path)
-                    if preview:
-                        attachment_hints.append(
-                            f"\n[PDF节选: {file_name}]\n{preview}\n"
-                        )
-                    else:
-                        attachment_hints.append(
-                            f"\n[PDF提示: {file_name}] 当前未能提取 PDF 文本，请先基于文件名和上下文回答，并提示用户可粘贴关键段落。\n"
-                        )
-
-        if attachment_lines:
-            base = (user_content or "").strip()
-            if not base:
-                base = "我上传了附件，请先确认接收并根据附件内容回答。"
-            user_content = (
-                f"{base}\n\n"
-                f"[附件列表]\n" + "\n".join(attachment_lines)
-            )
-            if image_components or video_components:
-                user_content += (
-                    "\n\n[提示] 多媒体附件已作为原始文件随消息提供，请直接识别内容，"
-                    "不要调用 fetch_url 访问 file:// 本地路径。"
-                )
-            if attachment_hints:
-                user_content += "\n\n" + "\n".join(attachment_hints)
-
-        logger.info(f"[Lumi-Hub] 收到消息 (session={ws_session_id}, persona={persona_id}): {user_content}")
-
-        # 鉴权校验
-        user_id = self.active_sessions.get(ws_session_id)
-        if not user_id:
-            logger.warning(f"[Lumi-Hub] 未登录用户尝试发送消息，已拒绝")
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id, "type": "ERROR_ALERT", "source": "host", "target": "client",
-                "timestamp": int(time.time() * 1000), "payload": {"error_code": "UNAUTHORIZED", "detail": "请先登录"}
-            })
-            return
-
-        # 把附件作为独立消息存入数据库，与前端拆分展示逻辑对齐
-        if isinstance(attachments, list) and attachments:
-            for att in attachments:
-                att = att or {}
-                file_name = str(att.get("file_name", "未命名文件"))
-                mime_type = str(att.get("mime_type", "")).lower()
-                local_path = str(att.get("local_path", "") or att.get("storage_path", ""))
-                
-                is_img = mime_type.startswith("image/") or file_name.endswith(('.png', '.jpg', '.jpeg', '.webp'))
-                prefix = "[图片]" if is_img else "[附件]"
-                
-                self.db.save_message(
-                    user_id=user_id,
-                    role="user",
-                    content=f"{prefix} {local_path}|||{file_name}",
-                    client_msg_id=f"{msg_id}_att_{file_name}",
-                    persona_id=persona_id,
-                )
-
-        if original_user_content:
-            self.db.save_message(
-                user_id=user_id,
-                role="user",
-                content=original_user_content,
-                client_msg_id=msg_id,
-                persona_id=persona_id,
-            )
-        
-        # 确保 AstrBot 当前的默认人格是用户正在对话的人格
-        pm = _lumi_shared_state.get("persona_manager")
-        if pm:
-            try:
-                pm.default_persona = persona_id
-            except Exception as e:
-                logger.error(f"[Lumi-Hub] 同步人格状态失败: {e}")
-
-        # 1. 构造 AstrBotMessage（和 WebChatAdapter 做法一致）
-        abm = AstrBotMessage()
-        abm.self_id = "lumi_hub"
-        # 使用绑定的真实账号 user_id 而不是动态 session_id 作为识别，让大模型持久记忆用户
-        abm.sender = MessageMember(user_id=str(user_id), nickname=f"User_{user_id}")
-        abm.type = MessageType.FRIEND_MESSAGE
-        # SessionID 格式: lumi_hub!user_id!context_id!persona_id
-        abm.session_id = f"lumi_hub!{user_id}!{context_id}!{persona_id}"
-        abm.message_id = msg_id
-        abm_message_chain = [Plain(user_content)]
-        if image_components:
-            abm_message_chain.extend(image_components)
-        if video_components:
-            abm_message_chain.extend(video_components)
-
-        abm.message = abm_message_chain
-        abm.message_str = user_content
-        abm.raw_message = message
-        abm.timestamp = int(time.time())
-
-        # 2. 包装为 LumiMessageEvent
-        event = LumiMessageEvent(
-            message_str=user_content,
-            message_obj=abm,
-            platform_meta=self.metadata,
-            session_id=abm.session_id,
-            ws_server=self.ws_server,
-            ws_session_id=ws_session_id,
-            db=self.db,
-            user_id=user_id,
-            persona_id=persona_id,
-        )
-
-        # 3. 注入 AstrBot 事件队列（EventBus 会自动 handle、调 LLM、调 event.send()）
-        self.commit_event(event)
-        logger.info(f"[Lumi-Hub] 事件已提交到 AstrBot 队列 (msg_id={msg_id})")
-
-        # 4. 后台轮询跟踪该事件的生命周期，待其跑完整个 Pipeline 后发送 CHAT_RESPONSE_END 给客户端解锁UI
-        async def wait_for_event_completion():
-            # 阶段 A: 等待 EventBus 从 _event_queue 中读取并转移到 active_event_registry
-            while True:
-                if event not in self._event_queue._queue:
-                    break
-                await asyncio.sleep(0.1)
-                
-            # 给 Scheduler 注册事件留出一点点时间
-            await asyncio.sleep(0.2)
-            
-            # 阶段 B: 等待 PipelineScheduler 彻底释放该活跃事件
-            try:
-                from astrbot.core.utils.active_event_registry import active_event_registry
-                umo = event.unified_msg_origin
-                while True:
-                    active_events = active_event_registry._events.get(umo, set())
-                    if event not in active_events:
-                        break
-                    await asyncio.sleep(0.5)
-            except Exception as e:
-                logger.warning(f"[Lumi-Hub] 跟踪事件生命周期时出错: {e}，将立即解锁。")
-
-            # 阶段 C: 事件生命周期完全结束，发送解锁信号
-            logger.debug(f"[Lumi-Hub] 消息 (msg_id={msg_id}) 管道执行已彻底结束，发送 CHAT_RESPONSE_END")
-            try:
-                await self.ws_server.send_to_client(ws_session_id, {
-                    "message_id": msg_id,
-                    "type": "CHAT_RESPONSE_END",
-                    "source": "host",
-                    "target": "client",
-                    "timestamp": int(time.time() * 1000),
-                    "payload": {"status": "success"},
-                })
-            except Exception as e:
-                logger.error(f"[Lumi-Hub] 发送 CHAT_RESPONSE_END 失败: {e}")
-
-        asyncio.create_task(wait_for_event_completion())
-
-    async def _handle_persona_switch(self, message: dict, ws_session_id: str) -> None:
-        """处理人格切换请求：真实切换 AstrBot 的默认人格。"""
-        payload = message.get("payload", {})
-        persona_id = payload.get("persona_id", "default")
-        msg_id = message.get("message_id", str(uuid.uuid4())[:8])
-
-        pm = _lumi_shared_state.get("persona_manager")
-        if pm:
-            try:
-                pm.default_persona = persona_id
-                logger.info(f"[Lumi-Hub] 人格已切换至: {persona_id}")
-                status = "switched"
-            except Exception as e:
-                logger.error(f"[Lumi-Hub] 切换人格失败: {e}")
-                status = "error"
-        else:
-            logger.warning("[Lumi-Hub] persona_manager 未初始化，无法切换人格")
-            status = "error"
-
-        await self.ws_server.send_to_client(ws_session_id, {
-            "message_id": msg_id,
-            "type": "PERSONA_SWITCH",
-            "source": "host",
-            "target": "client",
-            "timestamp": int(time.time() * 1000),
-            "payload": {"persona_id": persona_id, "status": status},
-        })
-
-    async def _handle_persona_clear_history(self, message: dict, ws_session_id: str) -> None:
-        """清空当前登录用户的所有聊天记录。"""
-        msg_id = message.get("message_id", str(uuid.uuid4())[:8])
-        user_id = self.active_sessions.get(ws_session_id)
-        payload = message.get("payload", {})
-        persona_id = payload.get("persona_id", "default")
-        
-        if not user_id:
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id, "type": "PERSONA_CLEAR_HISTORY_RESPONSE",
-                "source": "host", "target": "client",
-                "payload": {"status": "error", "message": "未登录"}
-            })
-            return
-        try:
-            count = self.db.clear_messages(user_id, persona_id)
-            logger.info(f"[Lumi-Hub] 用户 {user_id} 对人格 {persona_id} 的聊天记录已清空，共 {count} 条")
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id, "type": "PERSONA_CLEAR_HISTORY_RESPONSE",
-                "source": "host", "target": "client",
-                "payload": {"status": "success", "deleted_count": count}
-            })
-        except Exception as e:
-            logger.error(f"[Lumi-Hub] 清空聊天记录失败: {e}")
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id, "type": "PERSONA_CLEAR_HISTORY_RESPONSE",
-                "source": "host", "target": "client",
-                "payload": {"status": "error", "message": str(e)}
-            })
-
-    async def _handle_message_delete(self, message: dict, ws_session_id: str) -> None:
-        """删除当前登录用户在指定人格下的指定消息。"""
-        msg_id = message.get("message_id", str(uuid.uuid4())[:8])
-        user_id = self.active_sessions.get(ws_session_id)
-        payload = message.get("payload", {})
-        persona_id = payload.get("persona_id", "default")
-        message_ids = payload.get("message_ids", [])
-
-        if not user_id:
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id,
-                "type": "MESSAGE_DELETE_RESPONSE",
-                "source": "host",
-                "target": "client",
-                "payload": {"status": "error", "message": "未登录"}
-            })
-            return
-
-        if not isinstance(message_ids, list) or not message_ids:
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id,
-                "type": "MESSAGE_DELETE_RESPONSE",
-                "source": "host",
-                "target": "client",
-                "payload": {"status": "error", "message": "message_ids 不能为空"}
-            })
-            return
-
-        try:
-            deleted_count = self.db.delete_messages(user_id=user_id, message_ids=message_ids, persona_id=persona_id)
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id,
-                "type": "MESSAGE_DELETE_RESPONSE",
-                "source": "host",
-                "target": "client",
-                "payload": {"status": "success", "deleted_count": deleted_count}
-            })
-        except Exception as e:
-            logger.error(f"[Lumi-Hub] 删除消息失败: {e}")
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id,
-                "type": "MESSAGE_DELETE_RESPONSE",
-                "source": "host",
-                "target": "client",
-                "payload": {"status": "error", "message": str(e)}
-            })
-
-    async def _handle_persona_delete(self, message: dict, ws_session_id: str) -> None:
-        """从 AstrBot 中删除指定人格。"""
-        payload = message.get("payload", {})
-        persona_id = payload.get("persona_id", "")
-        msg_id = message.get("message_id", str(uuid.uuid4())[:8])
-
-        pm = _lumi_shared_state.get("persona_manager")
-        if pm and persona_id:
-            try:
-                await pm.delete_persona(persona_id)
-                logger.info(f"[Lumi-Hub] 人格 '{persona_id}' 已删除")
-                await self.ws_server.send_to_client(ws_session_id, {
-                    "message_id": msg_id, "type": "PERSONA_DELETE_RESPONSE",
-                    "source": "host", "target": "client",
-                    "payload": {"status": "success", "persona_id": persona_id}
-                })
-            except Exception as e:
-                logger.error(f"[Lumi-Hub] 删除人格 '{persona_id}' 失败: {e}")
-                await self.ws_server.send_to_client(ws_session_id, {
-                    "message_id": msg_id, "type": "PERSONA_DELETE_RESPONSE",
-                    "source": "host", "target": "client",
-                    "payload": {"status": "error", "message": str(e)}
-                })
-        else:
-            await self.ws_server.send_to_client(ws_session_id, {
-                "message_id": msg_id, "type": "PERSONA_DELETE_RESPONSE",
-                "source": "host", "target": "client",
-                "payload": {"status": "error", "message": "persona_manager 未初始化或 persona_id 为空"}
-            })
-
-    async def _handle_persona_list(self, message: dict, ws_session_id: str) -> None:
-        """返回 AstrBot 中已有的人格列表。"""
-        try:
-            personas = await db_helper.get_personas()
-            persona_list = []
-            for p in personas:
-                persona_list.append({
-                    "id": p.persona_id,
-                    "name": p.persona_id,  # AstrBot 的 persona_id 就是名称
-                    "system_prompt_preview": (p.system_prompt[:200] + "...") if len(p.system_prompt) > 200 else p.system_prompt,
-                    "has_begin_dialogs": bool(p.begin_dialogs),
-                    "tools": p.tools,
-                    "skills": p.skills,
-                })
-            logger.info(f"[Lumi-Hub] 返回 {len(persona_list)} 个人格")
-        except Exception as e:
-            logger.error(f"[Lumi-Hub] 读取人格列表失败: {e}")
-            persona_list = []
-
-        await self.ws_server.send_to_client(ws_session_id, {
-            "message_id": message.get("message_id", str(uuid.uuid4())[:8]),
-            "type": "PERSONA_LIST",
-            "source": "host",
-            "target": "client",
-            "timestamp": int(time.time() * 1000),
-            "payload": {
-                "personas": persona_list,
-            },
-        })
